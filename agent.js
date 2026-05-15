@@ -197,9 +197,11 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
+          // Deep-clone messages to preserve reasoning_content (OpenAI SDK strips unknown fields)
+          const messagesClone = JSON.parse(JSON.stringify(messages));
           response = await client.chat.completions.create({
             model: usedModel,
-            messages,
+            messages: messagesClone,
             tools: getToolsForRole(agentType, goal),
             tool_choice: toolChoice,
             temperature: config.llm.temperature,
@@ -263,7 +265,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           }
         }
       }
-      messages.push(msg);
+      // Preserve reasoning_content for thinking models (e.g. mimo-v2.5-pro)
+      const msgToPush = { ...msg };
+      if (msg.reasoning_content && !msgToPush.reasoning_content) {
+        msgToPush.reasoning_content = msg.reasoning_content;
+      }
+      messages.push(msgToPush);
 
       // If the model didn't call any tools, it's done
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
