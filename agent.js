@@ -197,16 +197,79 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          // Deep-clone messages to preserve reasoning_content (OpenAI SDK strips unknown fields)
-          const messagesClone = JSON.parse(JSON.stringify(messages));
-          response = await client.chat.completions.create({
+          // Use streaming raw fetch — 9Router only returns reasoning_content in SSE mode
+          const body = {
             model: usedModel,
-            messages: messagesClone,
+            messages: JSON.parse(JSON.stringify(messages)),
             tools: getToolsForRole(agentType, goal),
             tool_choice: toolChoice,
             temperature: config.llm.temperature,
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
+            stream: true,
+          };
+          const apiBase = process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1";
+          const apiKey = process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY;
+          const res = await fetch(`${apiBase}/chat/completions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(5 * 60 * 1000),
           });
+          // Parse SSE stream to accumulate reasoning_content + content + tool_calls
+          let reasoningContent = "";
+          let content = "";
+          let toolCalls = null;
+          let finishReason = null;
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop();
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              const data = line.slice(6).trim();
+              if (data === "[DONE]") continue;
+              try {
+                const chunk = JSON.parse(data);
+                const delta = chunk.choices?.[0]?.delta;
+                if (!delta) continue;
+                if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
+                if (delta.content) content += delta.content;
+                if (delta.tool_calls) {
+                  if (!toolCalls) toolCalls = [];
+                  for (const tc of delta.tool_calls) {
+                    const idx = tc.index ?? 0;
+                    if (!toolCalls[idx]) {
+                      toolCalls[idx] = { id: tc.id || "", type: tc.type || "function", function: { name: tc.function?.name || "", arguments: tc.function?.arguments || "" } };
+                    } else {
+                      if (tc.id) toolCalls[idx].id = tc.id;
+                      if (tc.type) toolCalls[idx].type = tc.type;
+                      if (tc.function?.name) toolCalls[idx].function.name = tc.function.name;
+                      if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
+                    }
+                  }
+                }
+                if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
+              } catch {}
+            }
+          }
+          // Assemble response in OpenAI format
+          response = {
+            choices: [{
+              index: 0,
+              message: {
+                role: "assistant",
+                content: content || null,
+                reasoning_content: reasoningContent || undefined,
+                tool_calls: toolCalls || null,
+              },
+              finish_reason: finishReason,
+            }],
+          };
         } catch (error) {
           if (providerMode === "system" && isSystemRoleError(error)) {
             providerMode = "user_embedded";
@@ -276,9 +339,15 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
         // Hermes sometimes returns null content — pop the empty message and retry once
         if (!msg.content) {
-          messages.pop(); // remove the empty assistant message
-          log("agent", "Empty response, retrying...");
-          continue;
+          // Reasoning model (mimo) spent all tokens thinking — use reasoning_content as response
+          if (msg.reasoning_content) {
+            msgToPush.content = msg.reasoning_content;
+            log("agent", "Using reasoning_content as response (thinking model exhausted output tokens)");
+          } else {
+            messages.pop(); // remove the empty assistant message
+            log("agent", "Empty response, retrying...");
+            continue;
+          }
         }
         if (mustUseRealTool && !sawToolCall) {
           noToolRetryCount += 1;
